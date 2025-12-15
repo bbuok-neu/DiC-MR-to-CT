@@ -14,7 +14,7 @@
 # ============================================================================
 """
 Sampling/inference script for MR-to-CT medical image synthesis using DiC.
-Takes MR images as input and generates corresponding CT images.
+Takes MR images as input and generates corresponding CT images in VAE latent space.
 """
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -29,6 +29,7 @@ import argparse
 import os
 
 from diffusion import create_diffusion
+from diffusers.models import AutoencoderKL
 from utils.mrct_dataset import MRCTDataset
 from utils.parser_setter import extract_parser, printopt
 from dic_models import DiC_models
@@ -75,9 +76,17 @@ def main(args, unparsed):
         if rank == 0:
             print(f"Using learn_sigma={learn_sigma} from checkpoint")
     
+    # Load VAE for latent space encoding/decoding
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae.eval()
+    if rank == 0:
+        print(f"Loaded VAE: stabilityai/sd-vae-ft-{args.vae}")
+    
+    # Create model with 8-channel input (4ch noisy CT latent + 4ch MR latent)
+    latent_size = args.image_size // 8
     model = DiC_models[args.model](
-        input_size=args.image_size,
-        in_channels=2,  # 1 channel noisy CT + 1 channel MR condition
+        input_size=latent_size,  # Latent size (image_size / 8)
+        in_channels=8,  # 4 channel noisy CT latent + 4 channel MR latent
         num_classes=1,
         learn_sigma=learn_sigma,
         **(opts['network_g'] if opts.get('network_g') is not None else dict())
@@ -150,6 +159,9 @@ def main(args, unparsed):
     if rank == 0:
         print(f"Test dataset contains {len(test_dataset)} paired images")
 
+    # Latent size
+    latent_size = args.image_size // 8
+
     # Run sampling
     sample_idx = 0
     pbar = tqdm(test_loader, disable=(rank != 0))
@@ -159,29 +171,42 @@ def main(args, unparsed):
         ct_gt = ct_gt.to(device)
         batch_size = mr.shape[0]
         
-        # Generate initial noise
-        z = torch.randn(batch_size, 1, args.image_size, args.image_size, device=device)
+        # Expand single channel to 3 channels for VAE (grayscale -> RGB)
+        mr_3ch = mr.repeat(1, 3, 1, 1)
+        
+        # Encode MR to latent space
+        mr_latent = vae.encode(mr_3ch).latent_dist.sample().mul_(0.18215)
+        
+        # Generate initial noise in latent space
+        z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
         
         # Dummy class label
         y = torch.zeros(batch_size, dtype=torch.long, device=device)
         
-        # Define model function that concatenates noise and MR condition
+        # Define model function that concatenates noise and MR latent condition
         def model_fn(x, t, y):
-            # Concatenate noisy CT and MR condition
-            x_concat = torch.cat([x, mr], dim=1)  # (B, 2, H, W)
+            # Concatenate noisy CT latent and MR latent condition
+            x_concat = torch.cat([x, mr_latent], dim=1)  # (B, 8, H/8, W/8)
             out = model(x_concat, t, y)
-            # Model outputs 2 channels (or 4 if learn_sigma), but we only need CT channels
+            # Model outputs 8 channels (or 16 if learn_sigma), but we only need CT latent channels
             if learn_sigma:
-                # Return noise and variance for CT (channels 0 and 2)
-                return torch.cat([out[:, :1, :, :], out[:, 2:3, :, :]], dim=1)
+                # Return noise and variance for CT latent (first 4 and channels 8-11)
+                return torch.cat([out[:, :4, :, :], out[:, 8:12, :, :]], dim=1)
             else:
-                return out[:, :1, :, :]  # Only first channel for CT noise prediction
+                return out[:, :4, :, :]  # First 4 channels for CT latent noise prediction
         
-        # Sample using DDPM
-        samples = diffusion.p_sample_loop(
-            model_fn, z.shape, z, clip_denoised=True,
+        # Sample CT latent using DDPM
+        ct_latent_samples = diffusion.p_sample_loop(
+            model_fn, z.shape, z, clip_denoised=False,
             model_kwargs=dict(y=y), progress=False, device=device
         )
+        
+        # Decode CT latent to image space
+        ct_samples = vae.decode(ct_latent_samples / 0.18215).sample
+        # Convert from 3-channel to 1-channel (take mean)
+        ct_samples = ct_samples.mean(dim=1, keepdim=True)
+        # Clamp to valid range
+        ct_samples = torch.clamp(ct_samples, -1, 1)
         
         # Denormalize and save results
         for i in range(batch_size):
@@ -190,7 +215,7 @@ def main(args, unparsed):
                 global_idx = global_idx * world_size + rank
             
             # Denormalize CT prediction
-            ct_pred = MRCTDataset.denormalize(samples[i].squeeze(0).cpu())
+            ct_pred = MRCTDataset.denormalize(ct_samples[i].squeeze(0).cpu())
             ct_pred_np = ct_pred.numpy()
             
             # Save CT prediction
@@ -214,6 +239,7 @@ def main(args, unparsed):
         print(f"Done! Generated {sample_idx} samples.")
         print(f"Results saved to {output_dir}")
     
+    
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -229,6 +255,8 @@ if __name__ == "__main__":
     
     # Model settings
     parser.add_argument("--model", type=str, default="DiC-XL")
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema",
+                        help="VAE variant to use for latent space encoding")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to model checkpoint")
     parser.add_argument("--use-ema", action="store_true",

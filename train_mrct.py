@@ -14,7 +14,8 @@
 # ============================================================================
 """
 Training script for MR-to-CT medical image synthesis using DiC.
-Uses 2-channel input by concatenating noisy CT (1 ch) and MR condition (1 ch).
+Uses 8-channel input by concatenating noisy CT latent (4 ch) and MR latent (4 ch).
+Performs diffusion in VAE latent space following the original DiC approach.
 Supports:
 - Resume training from checkpoint
 - Online validation during training
@@ -37,6 +38,7 @@ import logging
 import os
 
 from diffusion import create_diffusion
+from diffusers.models import AutoencoderKL
 from utils.mrct_dataset import MRCTDataset
 from utils.parser_setter import extract_parser, printopt
 from dic_models import DiC_models
@@ -93,12 +95,13 @@ def create_logger(logging_dir, rank=0):
 
 
 @torch.no_grad()
-def validate(model, diffusion, val_loader, device, num_samples=4, num_sampling_steps=250, learn_sigma=False):
+def validate(model, vae, diffusion, val_loader, device, num_samples=4, num_sampling_steps=250, learn_sigma=False):
     """
-    Run validation by generating CT samples from MR images.
+    Run validation by generating CT samples from MR images in latent space.
     
     Args:
         model: The DiC model (or EMA model)
+        vae: VAE model for encoding/decoding
         diffusion: Diffusion object for sampling
         val_loader: Validation data loader
         device: Device to run on
@@ -107,7 +110,7 @@ def validate(model, diffusion, val_loader, device, num_samples=4, num_sampling_s
         learn_sigma: Whether model learns variance
     
     Returns:
-        List of (mr, ct_gt, ct_pred) tuples
+        List of (mr, ct_gt, ct_pred) tuples (all in image space)
     """
     model.eval()
     results = []
@@ -131,40 +134,50 @@ def validate(model, diffusion, val_loader, device, num_samples=4, num_sampling_s
             ct_gt = ct_gt[:remaining]
             batch_size = remaining
         
-        # Generate noisy CT latent (start from pure noise)
-        # For MR-CT task, we work in image space (single channel), not latent space
-        latent_size = mr.shape[-1]
-        z = torch.randn(batch_size, 1, latent_size, latent_size, device=device)
+        # Expand single channel to 3 channels for VAE (grayscale -> RGB)
+        mr_3ch = mr.repeat(1, 3, 1, 1)
+        
+        # Encode MR to latent space
+        mr_latent = vae.encode(mr_3ch).latent_dist.sample().mul_(0.18215)
+        
+        # Generate noisy CT latent (start from pure noise in latent space)
+        latent_size = mr_latent.shape[-1]
+        z = torch.randn(batch_size, 4, latent_size, latent_size, device=device)
         
         # Dummy class label (not used in MR-CT conditioning)
         y = torch.zeros(batch_size, dtype=torch.long, device=device)
         
-        # Sample CT from noise conditioned on MR
+        # Sample CT latent from noise conditioned on MR latent
         def model_fn(x, t, y):
-            # Concatenate noisy CT and MR condition
-            x_concat = torch.cat([x, mr], dim=1)  # (B, 2, H, W)
+            # Concatenate noisy CT latent and MR latent condition
+            x_concat = torch.cat([x, mr_latent], dim=1)  # (B, 8, H, W)
             out = model(x_concat, t, y)
-            # Model outputs 2 channels (or 4 if learn_sigma), but we only need CT channels
-            # For learn_sigma=False: model outputs 2 ch, return first 1 ch for CT noise
-            # For learn_sigma=True: model outputs 4 ch, return first 2 ch (1 noise + 1 variance) for CT
+            # Model outputs 8 channels (or 16 if learn_sigma), but we only need CT latent channels
             if learn_sigma:
-                # Return noise and variance for CT (channels 0 and 2)
-                return torch.cat([out[:, :1, :, :], out[:, 2:3, :, :]], dim=1)
+                # Return noise and variance for CT latent (first 4 and second 4 channels)
+                return torch.cat([out[:, :4, :, :], out[:, 8:12, :, :]], dim=1)
             else:
-                return out[:, :1, :, :]  # Only first channel for CT noise prediction
+                return out[:, :4, :, :]  # First 4 channels for CT latent noise prediction
         
-        # Use DDPM sampling
-        samples = sample_diffusion.p_sample_loop(
-            model_fn, z.shape, z, clip_denoised=True,
+        # Use DDPM sampling in latent space
+        ct_latent_samples = sample_diffusion.p_sample_loop(
+            model_fn, z.shape, z, clip_denoised=False,
             model_kwargs=dict(y=y), progress=False, device=device
         )
         
-        # Store results
+        # Decode CT latent to image space
+        ct_samples = vae.decode(ct_latent_samples / 0.18215).sample
+        # Convert from 3-channel to 1-channel (take first channel or average)
+        ct_samples = ct_samples.mean(dim=1, keepdim=True)
+        # Clamp to valid range
+        ct_samples = torch.clamp(ct_samples, -1, 1)
+        
+        # Store results (convert back to single channel image space)
         for i in range(batch_size):
             results.append((
                 mr[i].cpu(),
                 ct_gt[i].cpu(),
-                samples[i].cpu()
+                ct_samples[i].cpu()
             ))
         
         samples_collected += batch_size
@@ -262,11 +275,18 @@ def main(args, unparsed):
         dist.broadcast_object_list(exp_dir_list, src=0)
         experiment_dir, checkpoint_dir = exp_dir_list
 
-    # Create model with 2-channel input (noisy CT + MR condition)
-    # Output is 1 channel (or 2 if learn_sigma=True for CT prediction)
+    # Load VAE for latent space encoding/decoding
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae.eval()
+    if rank == 0:
+        logger.info(f"Loaded VAE: stabilityai/sd-vae-ft-{args.vae}")
+
+    # Create model with 8-channel input (4ch noisy CT latent + 4ch MR latent)
+    # Latent size is image_size / 8 (VAE downsamples by factor of 8)
+    latent_size = args.image_size // 8
     model = DiC_models[args.model](
-        input_size=args.image_size,  # Image size directly (no VAE encoding)
-        in_channels=2,  # 1 channel noisy CT + 1 channel MR condition
+        input_size=latent_size,  # Latent size (image_size / 8)
+        in_channels=8,  # 4 channel noisy CT latent + 4 channel MR latent
         num_classes=1,  # No class conditioning for MR-CT task
         learn_sigma=args.learn_sigma,
         **(opts['network_g'] if opts.get('network_g') is not None else dict())
@@ -368,34 +388,42 @@ def main(args, unparsed):
             mr = mr.to(device)
             ct = ct.to(device)
             
+            # Expand single channel to 3 channels for VAE (grayscale -> RGB)
+            mr_3ch = mr.repeat(1, 3, 1, 1)
+            ct_3ch = ct.repeat(1, 3, 1, 1)
+            
+            # Encode to latent space using VAE
+            with torch.no_grad():
+                mr_latent = vae.encode(mr_3ch).latent_dist.sample().mul_(0.18215)
+                ct_latent = vae.encode(ct_3ch).latent_dist.sample().mul_(0.18215)
+            
             # Sample random timesteps
-            t = torch.randint(0, diffusion.num_timesteps, (ct.shape[0],), device=device)
+            t = torch.randint(0, diffusion.num_timesteps, (ct_latent.shape[0],), device=device)
             
-            # Create noisy CT (x_t) from clean CT (x_0)
-            noise = torch.randn_like(ct)
-            ct_noisy = diffusion.q_sample(ct, t, noise=noise)
+            # Create noisy CT latent (x_t) from clean CT latent (x_0)
+            noise = torch.randn_like(ct_latent)
+            ct_latent_noisy = diffusion.q_sample(ct_latent, t, noise=noise)
             
-            # Concatenate noisy CT and MR condition as input
-            x_input = torch.cat([ct_noisy, mr], dim=1)  # (B, 2, H, W)
+            # Concatenate noisy CT latent and MR latent condition as input
+            x_input = torch.cat([ct_latent_noisy, mr_latent], dim=1)  # (B, 8, H/8, W/8)
             
             # Dummy class label (not used)
-            y = torch.zeros(ct.shape[0], dtype=torch.long, device=device)
+            y = torch.zeros(ct_latent.shape[0], dtype=torch.long, device=device)
             
             # Forward pass - model predicts noise (and optionally variance)
             model_output = model(x_input, t, y)
             
             # Compute loss
-            # Model outputs 2 channels (same as input), but CT is only 1 channel
-            # For learn_sigma=False: output has 2 channels, use first for CT noise
-            # For learn_sigma=True: output has 4 channels, split into 2 for noise and 2 for variance
-            B = ct.shape[0]
+            # Model outputs 8 channels (same as input), but CT latent is only 4 channels
+            # For learn_sigma=False: output has 8 channels, use first 4 for CT latent noise
+            # For learn_sigma=True: output has 16 channels, first 4 for noise, channels 8-11 for variance
             if args.learn_sigma:
-                # Output is 4 channels: 2 for noise (CT+MR), 2 for variance
-                # We only use first channel for CT noise prediction
-                noise_pred = model_output[:, :1, :, :]  # First channel only
+                # Output is 16 channels: 8 for noise (CT+MR latent), 8 for variance
+                # We only use first 4 channels for CT latent noise prediction
+                noise_pred = model_output[:, :4, :, :]
             else:
-                # Output is 2 channels, use first for CT noise prediction
-                noise_pred = model_output[:, :1, :, :]
+                # Output is 8 channels, use first 4 for CT latent noise prediction
+                noise_pred = model_output[:, :4, :, :]
             
             # MSE loss between predicted noise and actual noise
             mse_loss = torch.mean((noise_pred - noise) ** 2)
@@ -448,7 +476,7 @@ def main(args, unparsed):
                 if rank == 0:
                     logger.info(f"Running validation at step {train_steps}...")
                     results = validate(
-                        ema, diffusion, val_loader, device,
+                        ema, vae, diffusion, val_loader, device,
                         num_samples=args.val_num_samples,
                         num_sampling_steps=args.val_sampling_steps,
                         learn_sigma=args.learn_sigma
@@ -479,6 +507,8 @@ if __name__ == "__main__":
     
     # Model settings
     parser.add_argument("--model", type=str, default="DiC-XL")
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema",
+                        help="VAE variant to use for latent space encoding")
     parser.add_argument("--learn-sigma", action="store_true",
                         help="Learn variance in addition to mean")
     
