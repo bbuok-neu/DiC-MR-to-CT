@@ -14,7 +14,7 @@
 # ============================================================================
 """
 Training script for MR-to-CT medical image synthesis using DiC.
-Uses 8-channel input by concatenating noisy CT latent space and MR latent space.
+Uses 2-channel input by concatenating noisy CT (1 ch) and MR condition (1 ch).
 Supports:
 - Resume training from checkpoint
 - Online validation during training
@@ -38,6 +38,8 @@ import os
 
 from diffusion import create_diffusion
 from utils.mrct_dataset import MRCTDataset
+from utils.parser_setter import extract_parser, printopt
+from dic_models import DiC_models
 
 
 #################################################################################
@@ -223,14 +225,10 @@ def main(args, unparsed):
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     opts = dict()
-    from utils.parser_setter import extract_parser, printopt
     extract_parser(unparsed, opts)
     if rank == 0:
         print('----> Opt printed as follows:')
         printopt(opts)
-
-    # Import DiC model
-    from dic_models import DiC_models
 
     # Setup experiment folder or resume from existing
     if args.resume:

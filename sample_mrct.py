@@ -30,6 +30,8 @@ import os
 
 from diffusion import create_diffusion
 from utils.mrct_dataset import MRCTDataset
+from utils.parser_setter import extract_parser, printopt
+from dic_models import DiC_models
 
 
 def main(args, unparsed):
@@ -55,14 +57,10 @@ def main(args, unparsed):
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     opts = dict()
-    from utils.parser_setter import extract_parser, printopt
     extract_parser(unparsed, opts)
     if rank == 0:
         print('----> Opt printed as follows:')
         printopt(opts)
-
-    # Import DiC model
-    from dic_models import DiC_models
 
     # Load model
     assert args.ckpt is not None, "Must specify --ckpt for sampling"
@@ -85,8 +83,9 @@ def main(args, unparsed):
         **(opts['network_g'] if opts.get('network_g') is not None else dict())
     ).to(device)
     
-    # Load weights - try EMA first, then model
-    if args.use_ema and 'ema' in ckpt:
+    # Load weights - use EMA by default unless --no-ema is specified
+    use_ema = not args.no_ema
+    if use_ema and 'ema' in ckpt:
         model.load_state_dict(ckpt['ema'])
         if rank == 0:
             print("Loaded EMA weights")
@@ -108,10 +107,13 @@ def main(args, unparsed):
         args.output_dir,
         f"{args.model}-{ckpt_name}-steps{args.num_sampling_steps}-seed{args.global_seed}"
     )
+    # Use comparison by default unless --no-comparison is specified
+    save_comparison = not args.no_comparison
+    
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "ct_pred"), exist_ok=True)
-        if args.save_comparison:
+        if save_comparison:
             os.makedirs(os.path.join(output_dir, "comparison"), exist_ok=True)
         print(f"Saving results to {output_dir}")
     
@@ -196,7 +198,7 @@ def main(args, unparsed):
             ct_pred_img.save(os.path.join(output_dir, "ct_pred", f"{global_idx:06d}.png"))
             
             # Optionally save comparison (MR | CT_GT | CT_Pred)
-            if args.save_comparison:
+            if save_comparison:
                 mr_np = MRCTDataset.denormalize(mr[i].squeeze(0).cpu()).numpy()
                 ct_gt_np = MRCTDataset.denormalize(ct_gt[i].squeeze(0).cpu()).numpy()
                 comparison = np.concatenate([mr_np, ct_gt_np, ct_pred_np], axis=1)
@@ -229,8 +231,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="DiC-XL")
     parser.add_argument("--ckpt", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--use-ema", action="store_true", default=True,
-                        help="Use EMA weights for sampling (default: True)")
+    parser.add_argument("--use-ema", action="store_true",
+                        help="Use EMA weights for sampling (default: enabled)")
+    parser.add_argument("--no-ema", action="store_true",
+                        help="Do not use EMA weights for sampling")
     parser.add_argument("--learn-sigma", action="store_true",
                         help="Model learns variance (will be auto-detected from checkpoint)")
     
@@ -243,8 +247,10 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     
     # Output settings
-    parser.add_argument("--save-comparison", action="store_true", default=True,
-                        help="Save MR|CT_GT|CT_Pred comparison images")
+    parser.add_argument("--save-comparison", action="store_true",
+                        help="Save MR|CT_GT|CT_Pred comparison images (default: enabled)")
+    parser.add_argument("--no-comparison", action="store_true",
+                        help="Do not save comparison images")
     
     args, unparsed = parser.parse_known_args()
     main(args, unparsed)
